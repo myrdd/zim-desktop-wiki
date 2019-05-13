@@ -1,9 +1,5 @@
-# -*- coding: utf-8 -*-
 
 # Copyright 2009-2017 Jaap Karssenberg <jaap.karssenberg@gmail.com>
-
-
-from __future__ import with_statement
 
 
 import sqlite3
@@ -12,13 +8,14 @@ import logging
 logger = logging.getLogger('zim.notebook.index')
 
 try:
-	import gobject
+	from gi.repository import GObject
 except ImportError:
-	gobject = None
+	GObject = None
 
 
 from zim.newfs import LocalFile, File, Folder, FileNotFoundError
 from zim.signals import SignalEmitter
+from zim.utils import natural_sort_key
 
 from zim.notebook.operations import NotebookOperation, NotebookOperationOngoing, ongoing_operation
 
@@ -30,6 +27,7 @@ from .tags import *
 
 
 DB_VERSION = '0.8'
+DB_SORTKEY_CONTENT = 'text_1.2.3_unicode_αβγ_žžž'
 
 
 class Index(SignalEmitter):
@@ -64,11 +62,10 @@ class Index(SignalEmitter):
 		'''
 		self.dbpath = dbpath
 		self.layout = layout
-		self._db = self._new_connection()
-		self._db_check()
+		self._db_connect()
 		if not hasattr(self, 'update_iter'):
 			self._update_iter_init()
-		# else _update_iter_init already called view _db_check --> _db_init
+		# else _update_iter_init already called via _db_init()
 
 		self._checker = FilesIndexChecker(self._db, self.layout.root)
 		self.background_check = BackgroundCheck(self._checker, None)
@@ -81,40 +78,50 @@ class Index(SignalEmitter):
 	def on_commit(self, iter):
 		self.emit('changed')
 
-	def _new_connection(self):
-		db = sqlite3.Connection(self.dbpath)
-		db.row_factory = sqlite3.Row
-		db.execute('PRAGMA synchronous=OFF;')
-		# Don't wait for disk writes, we can recover from crashes
-		# anyway. Allows us to use commit more frequently.
-		return db
+	def _db_connect(self):
+		# NOTE: for a locked database, different errors happen on linux and
+		# on windows, so test both platforms when modifying here
 
-	def _db_check(self):
 		try:
-			if self.get_property('db_version') == DB_VERSION:
-				pass
-			else:
-				logger.debug('Index db_version out of date')
+			self._db = sqlite3.Connection(self.dbpath)
+		except:
+			self._db_recover()
+
+		self._db.row_factory = sqlite3.Row
+
+		try:
+			self._db.execute('PRAGMA synchronous=OFF;')
+			# Don't wait for disk writes, we can recover from crashes
+			# anyway. Allows us to use commit more frequently.
+
+			if self.get_property('db_version') != DB_VERSION:
+				logger.info('Index db_version out of date')
 				self._db_init()
+			elif self.get_property('db_sortkey_format') != natural_sort_key(DB_SORTKEY_CONTENT):
+				logger.info('Index db_sortkey_format out of date')
+				self._db_init()
+			else:
+				self.set_property('db_version', DB_VERSION) # Ensure we can write
 		except sqlite3.OperationalError:
 			# db is there but table does not exist
 			logger.debug('Operational error, init tabels')
 			self._db_init()
 		except sqlite3.DatabaseError:
-			assert not self.dbpath == ':memory:'
-			logger.warning('Overwriting possibly corrupt database: %s', self.dbpath)
-			self.db.close()
-			file = LocalFile(self.dbpath)
-			try:
-				file.remove()
-			except:
-				logger.exception('Could not delete: %s', file)
-				# TODO: how to recover form this ? - seems fatal
-			finally:
-				self._db = self._new_connection()
-				self._db_init()
+			self._db_recover()
 
-		# TODO checks on locale, others?
+	def _db_recover(self):
+		assert not self.dbpath == ':memory:'
+		logger.warning('Overwriting possibly corrupt database: %s', self.dbpath)
+		file = LocalFile(self.dbpath)
+		try:
+			file.remove(cleanup=False)
+		except:
+			logger.error('Could not access database file, running in-memory database')
+			self.dbpath = ':memory:'
+		finally:
+			self._db = sqlite3.Connection(self.dbpath)
+			self._db.row_factory = sqlite3.Row
+			self._db_init()
 
 	def _db_init(self):
 		tables = [r[0] for r in self._db.execute(
@@ -131,8 +138,9 @@ class Index(SignalEmitter):
 				value TEXT,
 				CONSTRAINT uc_MetaOnce UNIQUE (key)
 			);
-			INSERT INTO zim_index VALUES ('db_version', %r)
-		''' % DB_VERSION)
+			INSERT INTO zim_index VALUES ('db_version', %r);
+			INSERT INTO zim_index VALUES ('db_sortkey_format', %r)
+		''' % (DB_VERSION, natural_sort_key(DB_SORTKEY_CONTENT)))
 
 		self._update_iter_init() # Force re-init of all tables
 		self._db.commit()
@@ -160,7 +168,7 @@ class Index(SignalEmitter):
 		return self.update_iter.check_and_update_iter()
 
 	def check_async(self, notebook, paths, recursive=False):
-		assert gobject, 'async operation requires gobject mainloop'
+		assert GObject, 'async operation requires gobject mainloop'
 		for path in paths:
 			file, folder = self.layout.map_page(path)
 			self._checker.queue_check(file, recursive=recursive)
@@ -365,7 +373,7 @@ class BackgroundCheck(object):
 	def start(self):
 		if not self.running:
 			my_iter = iter(self.on_idle_iter())
-			gobject.idle_add(lambda: next(my_iter, False), priority=gobject.PRIORITY_LOW)
+			GObject.idle_add(lambda: next(my_iter, False), priority=GObject.PRIORITY_LOW)
 			self.running = True
 
 	def stop(self):
@@ -377,7 +385,7 @@ class BackgroundCheck(object):
 			logger.debug('BackgroundCheck started')
 			while self.running:
 				try:
-					needsupdate = check_iter.next()
+					needsupdate = next(check_iter)
 					if needsupdate:
 						self.callback()
 						logger.debug('BackgroundCheck found out-of-date')
@@ -395,13 +403,11 @@ class BackgroundCheck(object):
 def on_out_of_date_found(notebook, background_check):
 	op = IndexUpdateOperation(notebook)
 	op.connect('finished', lambda *a: background_check.start()) # continue checking
-		# TODO ensure robust in case operation gives error
-	try:
-		op.run_on_idle()
-	except NotebookOperationOngoing:
-		other_op = ongoing_operation(notebook)
+	other_op = ongoing_operation(notebook)
+	if other_op:
 		other_op.connect('finished', lambda *a: background_check.start()) # continue checking
-			# TODO ensure robust in case operation gives error
+	else:
+		op.run_on_idle()
 
 
 class IndexUpdateOperation(NotebookOperation):

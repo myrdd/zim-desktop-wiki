@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
 
 # Copyright 2009-2017 Jaap Karssenberg <jaap.karssenberg@gmail.com>
 
-from __future__ import with_statement
+
 
 import logging
 
@@ -14,7 +13,7 @@ from zim.notebook.page import Path, HRef, \
 	HREF_REL_ABSOLUTE, HREF_REL_FLOATING, HREF_REL_RELATIVE
 
 
-from .base import IndexerBase, IndexView
+from .base import IndexerBase, IndexView, IndexNotFoundError
 from .pages import PagesViewInternal, ROOT_ID
 
 
